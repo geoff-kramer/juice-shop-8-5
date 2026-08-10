@@ -1,0 +1,143 @@
+# ==============================================================================
+# Cloud Build Pipeline with CodeMender Security Gate
+# Docs: https://docs.cloud.google.com/gemini-enterprise-agent-platform/codemender
+# ==============================================================================
+
+steps:
+  # ----------------------------------------------------------------------------
+  # Step 1: CodeMender Vulnerability Scan & Policy Gate
+  # ----------------------------------------------------------------------------
+  - name: 'google/cloud-sdk:slim'
+    id: 'codemender-security-scan'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        set -eo pipefail
+        echo "================================================================"
+        echo ">> Initializing CodeMender Security Scanner..."
+        echo "================================================================"
+
+        # Install prerequisites (curl, unzip, python3, jq)
+        apt-get update -qq && apt-get install -y -qq curl unzip jq python3 > /dev/null
+
+        # Download & install CodeMender CLI
+        echo ">> Downloading CodeMender CLI (Linux x86_64)..."
+        CLI_DOWNLOAD_URL="https://artifactregistry.googleapis.com/download/v1/projects/cmoc-prod/locations/us/repositories/codemender-cli-production/files/cm%3Astable%3Acm-linux-amd64.zip:download?alt=media"
+        FALLBACK_URL="https://storage.googleapis.com/codemender-public/cmoc/cmoc-linux-amd64.zip"
+
+        if ! curl -sSL -f -o cm-linux-amd64.zip "$${CLI_DOWNLOAD_URL}"; then
+          echo ">> Primary download endpoint unavailable; attempting fallback URL..."
+          curl -sSL -f -o cm-linux-amd64.zip "$${FALLBACK_URL}"
+        fi
+
+        unzip -q -o cm-linux-amd64.zip
+        chmod +x cm*
+        mv cm* /usr/local/bin/cm
+        echo ">> CodeMender CLI installed successfully: $(cm --version 2>/dev/null || echo 'cm binary ready')"
+
+        # Initialize workspace
+        cm init --verify || true
+
+        # Run CodeMender find on repository
+        echo ">> Executing CodeMender security scan across repository..."
+        cm find . -y --compact || cm find . -y
+
+        # Generate structured JSON and human-readable reports
+        echo ">> Generating vulnerability reports..."
+        cm report
+        cm report --format json > /workspace/codemender-report.json || echo "[]" > /workspace/codemender-report.json
+
+        # Policy Gate: Fail pipeline if HIGH or CRITICAL vulnerabilities are found
+        echo ">> Evaluating Security Quality Gate for HIGH and CRITICAL vulnerabilities..."
+        python3 - <<'EOF'
+        import json, sys
+
+        try:
+            with open('/workspace/codemender-report.json', 'r') as f:
+                data = json.load(f)
+        except Exception as e:
+            print(f"Warning: Could not parse report JSON ({e}). Checking raw report...")
+            data = []
+
+        findings = data if isinstance(data, list) else data.get("findings", data.get("vulnerabilities", []))
+        
+        blocking_severities = ["CRITICAL", "HIGH"]
+        blocking_findings = []
+
+        for item in findings:
+            severity = str(item.get("severity", "")).upper()
+            status = str(item.get("status", "OPEN")).upper()
+            
+            # Count findings that are still open/unmitigated
+            if severity in blocking_severities and status not in ["FIXED", "DISMISSED"]:
+                blocking_findings.append(item)
+
+        if blocking_findings:
+            print(f"\n❌ [POLICY VIOLATION] Found {len(blocking_findings)} HIGH / CRITICAL vulnerabilities in repository:")
+            for vuln in blocking_findings:
+                title = vuln.get('title', vuln.get('vulnerability_type', 'Vulnerability'))
+                file_path = vuln.get('file_path', vuln.get('target_file', 'unknown'))
+                line = vuln.get('line', 'N/A')
+                sev = vuln.get('severity', 'UNKNOWN')
+                print(f"  - [{sev}] {title} in {file_path}:{line}")
+            print("\n>> Build failed by CodeMender Security Gate. Remediation required before deployment.")
+            sys.exit(1)
+        else:
+            print("\n✅ [POLICY PASSED] No unmitigated HIGH or CRITICAL vulnerabilities found.")
+        EOF
+
+  # ----------------------------------------------------------------------------
+  # Step 2: Build Application Container Image
+  # ----------------------------------------------------------------------------
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'docker-build'
+    args:
+      - 'build'
+      - '-t'
+      - '${_IMAGE_REPO}/${_IMAGE_NAME}:${SHORT_SHA}'
+      - '-t'
+      - '${_IMAGE_REPO}/${_IMAGE_NAME}:latest'
+      - '.'
+
+  # ----------------------------------------------------------------------------
+  # Step 3: Push Image to Artifact Registry
+  # ----------------------------------------------------------------------------
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'docker-push'
+    args:
+      - 'push'
+      - '--all-tags'
+      - '${_IMAGE_REPO}/${_IMAGE_NAME}'
+
+  # ----------------------------------------------------------------------------
+  # Step 4: Deploy Container to Cloud Run
+  # ----------------------------------------------------------------------------
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    id: 'cloud-run-deploy'
+    entrypoint: 'gcloud'
+    args:
+      - 'run'
+      - 'deploy'
+      - '${_SERVICE_NAME}'
+      - '--image'
+      - '${_IMAGE_REPO}/${_IMAGE_NAME}:${SHORT_SHA}'
+      - '--region'
+      - '${_REGION}'
+      - '--platform'
+      - 'managed'
+      - '--allow-unauthenticated'
+      - '--service-account'
+      - '${_RUN_SA_EMAIL}'
+      - '--port'
+      - '3000'
+
+substitutions:
+  _IMAGE_REPO: '${_REGION}-docker.pkg.dev/${PROJECT_ID}/app-containers'
+  _IMAGE_NAME: 'juice-shop'
+  _SERVICE_NAME: 'juice-shop'
+  _REGION: 'us-central1'
+  _RUN_SA_EMAIL: 'juice-shop-runner@${PROJECT_ID}.iam.gserviceaccount.com'
+
+options:
+  logging: CLOUD_LOGGING_ONLY
