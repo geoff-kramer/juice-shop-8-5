@@ -14,6 +14,7 @@ steps:
       - '-c'
       - |
         set -eo pipefail
+        export DEBIAN_FRONTEND=noninteractive
         echo "================================================================"
         echo ">> Initializing CodeMender Security Scanner..."
         echo "================================================================"
@@ -31,13 +32,17 @@ steps:
           curl -sSL -f -o cm-linux-amd64.zip "$${FALLBACK_URL}"
         fi
 
-        unzip -q -o cm-linux-amd64.zip
-        chmod +x cm*
-        mv cm* /usr/local/bin/cm
+        mkdir -p /tmp/cm_install
+        unzip -q -o cm-linux-amd64.zip -d /tmp/cm_install
+        BIN_FILE=$(find /tmp/cm_install -type f -name "cm*" | head -n 1)
+        chmod +x "$${BIN_FILE}"
+        mv "$${BIN_FILE}" /usr/local/bin/cm
+        rm -rf /tmp/cm_install cm-linux-amd64.zip
         echo ">> CodeMender CLI installed successfully: $(cm --version 2>/dev/null || echo 'cm binary ready')"
 
         # Initialize workspace
-        cm init --verify || true
+        echo ">> Initializing CodeMender workspace..."
+        cm init
 
         # Run CodeMender find on repository
         echo ">> Executing CodeMender security scan across repository..."
@@ -45,43 +50,58 @@ steps:
 
         # Generate structured JSON and human-readable reports
         echo ">> Generating vulnerability reports..."
-        cm report
-        cm report --format json > /workspace/codemender-report.json || echo "[]" > /workspace/codemender-report.json
+        cm report | tee /workspace/codemender-report.txt
+        cm report --format json > /workspace/codemender-report.json 2>&1 || true
 
         # Policy Gate: Fail pipeline if HIGH or CRITICAL vulnerabilities are found
         echo ">> Evaluating Security Quality Gate for HIGH and CRITICAL vulnerabilities..."
         python3 - <<'EOF'
-        import json, sys
+        import json, sys, re
 
-        try:
-            with open('/workspace/codemender-report.json', 'r') as f:
-                data = json.load(f)
-        except Exception as e:
-            print(f"Warning: Could not parse report JSON ({e}). Checking raw report...")
-            data = []
-
-        findings = data if isinstance(data, list) else data.get("findings", data.get("vulnerabilities", []))
-        
-        blocking_severities = ["CRITICAL", "HIGH"]
         blocking_findings = []
 
-        for item in findings:
-            severity = str(item.get("severity", "")).upper()
-            status = str(item.get("status", "OPEN")).upper()
-            
-            # Count findings that are still open/unmitigated
-            if severity in blocking_severities and status not in ["FIXED", "DISMISSED"]:
-                blocking_findings.append(item)
+        # 1. Attempt JSON parsing with log stripping
+        try:
+            with open('/workspace/codemender-report.json', 'r', errors='ignore') as f:
+                raw_content = f.read()
 
+            # Find the JSON array or object inside the output (stripping any [INFO] logs)
+            match = re.search(r'(\[.*\]|\{.*\})', raw_content, re.DOTALL)
+            if match:
+                data = json.loads(match.group(1))
+                findings = data if isinstance(data, list) else data.get("findings", data.get("vulnerabilities", []))
+                for item in findings:
+                    sev = str(item.get("severity", "")).upper()
+                    status = str(item.get("status", "OPEN")).upper()
+                    if ("HIGH" in sev or "CRITICAL" in sev) and status not in ["FIXED", "DISMISSED"]:
+                        title = item.get('title', item.get('vulnerability_type', 'Vulnerability'))
+                        path = item.get('file_path', item.get('target_file', 'unknown'))
+                        line = item.get('line', 'N/A')
+                        blocking_findings.append(f"[{sev}] {title} ({path}:{line})")
+        except Exception as e:
+            print(f"Note: JSON parser encountered: {e}. Falling back to tabular report...")
+
+        # 2. Fallback / Verification: Parse table output directly
+        try:
+            with open('/workspace/codemender-report.txt', 'r', errors='ignore') as f:
+                for line in f:
+                    # Match table rows containing CRITICAL or HIGH severity with OPEN status
+                    if ("CRITICAL" in line or "HIGH" in line) and "OPEN" in line:
+                        clean_line = " ".join(line.strip().replace("│", " ").split())
+                        if clean_line and clean_line not in blocking_findings:
+                            blocking_findings.append(clean_line)
+        except Exception as e:
+            print(f"Note: Text parser encountered: {e}")
+
+        # 3. Enforce Security Quality Gate
         if blocking_findings:
-            print(f"\n❌ [POLICY VIOLATION] Found {len(blocking_findings)} HIGH / CRITICAL vulnerabilities in repository:")
+            print("\n" + "="*70)
+            print(f"❌ [POLICY VIOLATION] Found {len(blocking_findings)} HIGH / CRITICAL vulnerabilities in repository:")
+            print("="*70)
             for vuln in blocking_findings:
-                title = vuln.get('title', vuln.get('vulnerability_type', 'Vulnerability'))
-                file_path = vuln.get('file_path', vuln.get('target_file', 'unknown'))
-                line = vuln.get('line', 'N/A')
-                sev = vuln.get('severity', 'UNKNOWN')
-                print(f"  - [{sev}] {title} in {file_path}:{line}")
-            print("\n>> Build failed by CodeMender Security Gate. Remediation required before deployment.")
+                print(f"  • {vuln}")
+            print("="*70)
+            print(">> Build failed by CodeMender Security Gate. Remediation required before deployment.\n")
             sys.exit(1)
         else:
             print("\n✅ [POLICY PASSED] No unmitigated HIGH or CRITICAL vulnerabilities found.")
@@ -131,6 +151,8 @@ steps:
       - '${_RUN_SA_EMAIL}'
       - '--port'
       - '3000'
+      - '--memory'
+      - '1Gi'
 
 substitutions:
   _IMAGE_REPO: '${_REGION}-docker.pkg.dev/${PROJECT_ID}/app-containers'
